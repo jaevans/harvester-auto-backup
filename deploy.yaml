@@ -1,0 +1,75 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: auto-backup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: auto-backup
+rules:
+  - apiGroups:
+      - harvesterhci.io
+    resources:
+      - virtualmachinebackups
+    verbs:
+      - get
+      - list
+      - create
+      - delete
+  - apiGroups:
+      - kubevirt.io
+    resources:
+      - virtualmachines
+    verbs:
+      - get
+      - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: auto-backup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: auto-backup
+subjects:
+  - kind: ServiceAccount
+    name: auto-backup
+    namespace: auto-backup
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: auto-backup
+  namespace: auto-backup
+imagePullSecrets:
+  - name: regcred
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: auto-backup
+  namespace: auto-backup
+spec:
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 5
+  successfulJobsHistoryLimit: 5
+  schedule: "0 2 * * *"
+  jobTemplate:
+    metadata:
+      name: auto-backup
+    spec:
+      template:
+        spec:
+          serviceAccountName: auto-backup
+          restartPolicy: Never
+          containers:
+            - name: auto-backup
+              image: jaecontainers/harvester-auto-backup:latest
+              imagePullPolicy: Always
+              args:
+                - --label
+                - auto-backup
+                - --verbose

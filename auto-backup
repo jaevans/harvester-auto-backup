@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+
+# Given the name of a VirtualMachine in harvester, this script will
+# 1. Create a backup of the VM
+# 2. Apply a label to the backup with the current date and time
+# 3. Delete any backups older than 30 days, keeping 1 per week for the past 3 months, and one per month for the past year
+
+# This script is intended to be run as a cron job
+
+# Using kubectl, enmerate all VirtualMachineBackups in the cluster
+# For each VirtualMachineBackup, get the created timestamp
+# If the timestamp is older than 1 year, delete it
+# If the timestamp is older than 3 months, and it is not the last backup for that month, delete it
+# If the timestamp is older than 30 days, and it is not the last backup for that week, delete it
+
+# Figure out if we are on linux or mac
+if [[ "${OSTYPE}" == "linux-gnu"* ]]; then
+    # Linux
+    date_cmd="date"
+elif [[ "${OSTYPE}" == "darwin"* ]]; then
+    # Mac OSX
+    # Sine we're expecting to run in linux, assume gdate is installed for development
+    date_cmd="gdate"
+else
+    echo "Warning: Unsupported OS: ${OSTYPE}"
+    echo "Assuming date works"
+    date_cmd="date"
+    # exit 1
+fi
+
+# Check for required commands
+required_commands=(kubectl "${date_cmd}" sort )
+for command in "${required_commands[@]}"; do
+    if ! command -v "${command}" &> /dev/null; then
+        echo "Error: ${command} is required but not installed"
+        exit 1
+    fi
+done
+
+# Times for comparison to decide how to smart delete backups
+## EDIT THESE TO CHANGE THE BACKUP RETENTION POLICY
+keep_weekly_after=$(${date_cmd} --utc -d "2 weeks ago" +%Y-%m-%d)
+keep_monthly_after=$(${date_cmd} --utc -d "2 month ago" +%Y-%m-%d)
+delete_after=$(${date_cmd} --utc -d "1 year ago" +%Y-%m-%d)
+
+# Parse the command line flags
+usage="Usage: $(basename "$0") [-v|--verbose] [--dry-run] -l|--label <label> [-n|--namespace <namespace>] [<namespace>/]<vm_name>"
+read -r -d '' long_help <<EOF
+${usage}
+
+This script will create a backup of the given VM, and then delete any backups older than 30 days, 
+keeping 1 per week for the past 3 months, and one per month for the past year.
+
+Options:
+    -v|--verbose - Print verbose output
+    --dry-run - Don't actually delete anything
+    -l|--label - The label to use to find VMs to backup. Only VMs with this label set to "true" will be backed up.
+    -n|--namespace - Only search for VMs and backups in this namespace
+    -h|--help - Print help
+
+    The namespace can be specified with either --namespace or as part of the VM name, separated by a slash (/).
+
+Examples:
+    # Backup all VMs in all namespaces with the label "back-me-up=true"
+    $(basename "$0") -l back-me-up
+    
+    # Backup VMs with the "back-me-up=true" label in the namespace "my-namespace"
+    $(basename "$0") -n my-namespace -l back-me-up
+
+    # Simulate backing up VM "my-vm" in the namespace "my-namespace", and print verbose output
+    $(basename "$0") -v --dry-run my-namespace/my-vm
+
+
+EOF
+
+function verbose() {
+    if [[ "${verbose}" == "1" ]]; then
+        echo "$@"
+    fi
+}
+
+verbose=0
+dry_run=0
+
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case ${key} in
+        -v|--verbose)
+            verbose=1
+            shift
+            ;;
+        --dry-run)
+            dry_run=1
+            shift
+            ;;
+        -n|--namespace)
+            only_namespace="$2"
+            shift
+            shift
+            ;;
+        -l|--label)
+            label="$2"
+            shift
+            shift
+            ;;
+        -h|--help)
+            echo "${long_help}"
+            echo
+            exit 0
+            ;;
+        -*) # unknown option
+            echo "Error: Invalid Option: $1"
+            echo "Try '$(basename "$0") --help' for more information."
+            exit 1
+            ;;
+        *)
+            # vm_name="$1"
+            echo "Error: Extra argument: $1"
+            echo "Try '$(basename "$0") --help' for more information."
+            exit 1
+            ;;
+    esac
+done
+
+namespace_option=
+if [[ -n "${only_namespace}" ]]; then
+    namespace_option="-n ${only_namespace}"
+else
+    namespace_option="-A"
+fi
+
+if [[ -z "${label}" ]]; then
+    echo "Error: Label name must be provided"
+    echo
+    echo "${usage}"
+    exit 1
+fi
+# Find all VMs with the label given in ${label} set to true.
+# If ${namespace} is set, only search in that namespace
+# shellcheck disable=SC2086 # We want to expand the namespace_option variable into multiple words
+mapfile -t -d ' ' vms < <(kubectl get vm ${namespace_option} -l "${label}=true" -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{" "}{end}')
+
+# If there are no VMs with the given label, exit
+if [[ "${#vms[*]}" -eq 0 ]]; then
+    echo "No VMs found with label ${label}"
+    exit 0
+fi
+
+verbose "Found VMs with label ${label}:" "${vms[@]}"
+
+# List of backups to delete
+to_delete=()
+
+# shellcheck disable=SC2068 # We want to expand the vms variable into multiple words
+for name in ${vms[@]}; do
+    namespace=${name%/*}
+    vm_name=${name#*/}
+
+    # Create a backup of the VM
+    echo "Creating backup of ${vm_name} in namespace ${namespace}"
+    current_datetime=$(${date_cmd} --utc +%Y-%m-%d-%H%M%S)
+    read -r -d '' kubecmd <<EOF
+apiVersion: harvesterhci.io/v1beta1
+kind: VirtualMachineBackup
+metadata:
+    name: autobackup-${current_datetime}
+    namespace: ${namespace}
+spec:
+  source:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: ${vm_name}
+EOF
+
+    # If not in dry run mode, create the backup
+    if [[ "${dry_run}" == "1" ]]; then
+        echo "Dry run mode, not creating backup"
+        verbose echo "${kubecmd}"
+    else
+        # Skip the rest of the loop if the backup failed
+        ( echo "${kubecmd}" | kubectl apply -f - ) || { echo "Failed to create backup, skipping backup deletion"; continue; }
+    fi
+
+
+    echo "Finding backups of ${vm_name} in namespace ${namespace} for cleanup" 
+    # Get all VirtualMachineBackups for the given VM
+    mapfile -t -d ' ' vm_backup_dates < <(kubectl get virtualmachinebackups -n "${namespace}" -o jsonpath="{range .items[?(@.spec.source.name=='${vm_name}')]}{.metadata.creationTimestamp}{'/'}{.metadata.namespace}{'/'}{.metadata.name}{' '}{end}")
+
+
+    if [[ "${#vm_backup_dates[*]}" -eq 0 ]]; then
+        echo "No backups found for VM ${vm_name} in namespace ${namespace}"
+        continue
+    fi
+
+    # fake data for testing
+    # vm_backup_dates=(2023-07-05T12:00:53Z/sicura/fix-disks 2023-07-25T04:12:00Z/sicura/testing-for-script-1 2023-01-01T06:00:00Z/sicura/newyears 2023-06-12T00:00:00Z/sicura/june-12 2023-06-13T00:00:00Z/sicura/june-13 2023-06-14T00:00:00Z/sicura/june-14 2023-06-15T00:00:00Z/sicura/june-15 2023-02-01T00:00:00Z/sicura/feb-one 2023-01-03T00:00:00Z/sicura/jan3rd 2022-01-01T00:00:00Z/sicura/newyears-old)
+    
+    declare -A backups_by_week
+    declare -A backups_by_month
+    for backup in "${vm_backup_dates[@]}" ; do
+        # For each backup, separate the timestamp from the name
+        timestamp=${backup%%/*}
+        namespaced_name=${backup#*/}
+        namespace=${namespaced_name%/*}
+        name=${namespaced_name#*/}
+        verbose "Found backup ${name} created at ${timestamp} in namespace ${namespace}"
+
+        # If the backup is older than one year, delete it
+        if [[ "${timestamp}" < "${delete_after}" ]]; then
+            verbose "Deleting ${namespaced_name} due to it being older than 1 year"
+            to_delete+=("${namespaced_name}")
+            continue   
+        fi
+
+        # if the backup is more than 3 months old, sort it by month
+        if [[ "${timestamp}" < "${keep_monthly_after}" ]]; then
+            # Get the month the backup was created
+            month=$(${date_cmd} --utc -d "${timestamp}" +%m)
+            # Add the backup to the list of backups for that month
+            verbose "Adding ${namespaced_name} to the list of backups for month ${month}"
+            backups_by_month[${month}]+="${namespaced_name} "
+            continue
+        fi
+
+        # If the backup is more than 30 days old, sort it by week
+        if [[ "${timestamp}" < "${keep_weekly_after}" ]]; then
+            # Get the week of the year the backup was created
+            week_of_year=$(${date_cmd} --utc -d "${timestamp}" +%U)
+            # Add the backup to the list of backups for that week
+            verbose "Adding ${namespaced_name} to the list of backups for week ${week_of_year}"
+            backups_by_week[${week_of_year}]+="${namespaced_name} "
+        fi
+    done
+
+    # Go through the backups by month, and delete all but the last one    
+    for month in "${!backups_by_month[@]}"; do
+        # Get the sorted list of backups for the month 
+        # shellcheck disable=SC2312
+        mapfile -d ' ' -t backups < <(printf "%s" "${backups_by_month[${month}]}" | xargs -n1 | sort -r -b | xargs)
+        verbose "Backups for ${month}:" "${backups[@]}"
+        # Delete all but the last backup
+        for backup in "${backups[@]::${#backups[@]}-1}"; do
+            # namespace=${backup%/*}
+            # name=${backup#*/}
+            echo "Deleting ${backup} due to it not being the last backup for the month"
+            to_delete+=("${backup}")
+        done
+    done
+
+    # Go through the backups by week, and delete all but the last one
+    for week in "${!backups_by_week[@]}"; do
+        # Get the sorted list of backups for the week
+        # shellcheck disable=SC2312
+        mapfile -d ' ' -t backups < <(printf "%s" "${backups_by_week[${week}]}" | xargs -n1 | sort -r -b | xargs)
+        verbose "Backups for ${week}:" "${backups[@]}"
+        # Delete all but the last backup
+        for backup in "${backups[@]::${#backups[@]}-1}"; do
+            # name=${backup#*/}
+            echo "Deleting ${backup} due to it not being the last backup for the week"
+            to_delete+=("${backup}")
+        done
+    done
+done
+
+echo
+echo "Found ${#to_delete[@]} backups to delete"
+echo
+
+# Delete the backups
+echo "Deleting backups"
+if [[ "${dry_run}" == "1" ]]; then
+    echo "Dry run mode, not deleting backups"
+fi
+for backup in "${to_delete[@]}"; do
+    namespace=${backup%/*}
+    name=${backup#*/}
+    verbose "Deleting backup named ${name} in namespace ${namespace}"
+    if [[ "${dry_run}" == "1" ]]; then
+        verbose "kubectl delete --ignore-not-found virtualmachinebackups -n ${namespace} ${name}"
+        continue
+    fi
+    kubectl delete --ignore-not-found virtualmachinebackups -n "${namespace}" "${name}"
+done
+
+
