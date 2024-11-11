@@ -8,11 +8,15 @@ jobs:
     steps:
       - name: ⤵️ Check out code from GitHub
         uses: actions/checkout@v3
-      - name: Kaniko build
-        uses: aevea/action-kaniko@v0.12.0
+      - uses: docker/login-action@v1
         with:
-          image: gitea.clark-evans.com/milamber/harvester-backup
-          username: ${{ secrets.PACKAGEPUSHUSER }}
-          password: ${{ secrets.PACKAGEPUSHTOKEN }}
-          # cache: true
-          # cache_registry: aevea/cache
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: int128/kaniko-action@v1
+        with:
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache: true
+          cache-repository: ghcr.io/${{ github.repository }}/cache
