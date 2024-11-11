@@ -5,6 +5,11 @@ jobs:
   build:
     name: Build Container
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
     steps:
       - name: ⤵️ Check out code from GitHub
         uses: actions/checkout@v4
