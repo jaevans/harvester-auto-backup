@@ -17,7 +17,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: jaevans/harvester-auto-backup
+          images: ghcr.io/${{ github.repository }}
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
